@@ -34,7 +34,7 @@ func TestPeekAndAssertPrefix(t *T) {
 		{[]byte("-foo\r\n"), SimpleErrorPrefix, nil},
 		// TODO BlobErrorPrefix
 		{[]byte("-foo\r\n"), NumberPrefix, resp.ErrConnUsable{Err: SimpleError{
-			E: errors.New("foo"),
+			S: "foo",
 		}}},
 	}
 
@@ -100,8 +100,8 @@ func TestRESPTypes(t *T) {
 		{in: &SimpleString{S: ""}, exp: "+\r\n"},
 		{in: &SimpleString{S: "foo"}, exp: "+foo\r\n"},
 
-		{in: &SimpleError{E: errors.New("")}, exp: "-\r\n", errStr: true},
-		{in: &SimpleError{E: errors.New("foo")}, exp: "-foo\r\n", errStr: true},
+		{in: &SimpleError{S: ""}, exp: "-\r\n", errStr: true},
+		{in: &SimpleError{S: "foo"}, exp: "-foo\r\n", errStr: true},
 
 		{in: &Number{N: 5}, exp: ":5\r\n"},
 		{in: &Number{N: 0}, exp: ":0\r\n"},
@@ -120,9 +120,9 @@ func TestRESPTypes(t *T) {
 		{in: &Boolean{B: false}, exp: "#f\r\n"},
 		{in: &Boolean{B: true}, exp: "#t\r\n"},
 
-		{in: &BlobError{E: errors.New("")}, exp: "!0\r\n\r\n"},
-		{in: &BlobError{E: errors.New("foo")}, exp: "!3\r\nfoo\r\n"},
-		{in: &BlobError{E: errors.New("foo\r\nbar")}, exp: "!8\r\nfoo\r\nbar\r\n"},
+		{in: &BlobError{B: []byte("")}, exp: "!0\r\n\r\n"},
+		{in: &BlobError{B: []byte("foo")}, exp: "!3\r\nfoo\r\n"},
+		{in: &BlobError{B: []byte("foo\r\nbar")}, exp: "!8\r\nfoo\r\nbar\r\n"},
 
 		{in: &VerbatimStringBytes{B: nil, Format: []byte("txt")}, exp: "=4\r\ntxt:\r\n"},
 		{in: &VerbatimStringBytes{B: []byte{}, Format: []byte("txt")}, exp: "=4\r\ntxt:\r\n",
@@ -240,12 +240,12 @@ func TestRESPTypes(t *T) {
 }
 
 // structs used for tests
-type testStructInner struct {
+type TestStructInner struct {
 	Foo int
 	bar int
 	Baz string `redis:"BAZ"`
 	Buz string `redis:"-"`
-	Boz *int
+	Boz *int64
 }
 
 func intPtr(i int) *int {
@@ -253,12 +253,12 @@ func intPtr(i int) *int {
 }
 
 type testStructA struct {
-	testStructInner
+	TestStructInner
 	Biz []byte
 }
 
 type testStructB struct {
-	*testStructInner
+	*TestStructInner
 	Biz []byte
 }
 
@@ -280,6 +280,7 @@ func (cm binCPMarshaler) MarshalBinary() ([]byte, error) {
 	return cm, nil
 }
 
+/*
 func TestAnyMarshal(t *T) {
 	type encodeTest struct {
 		in               interface{}
@@ -435,7 +436,7 @@ func TestAnyMarshal(t *T) {
 		// Structs
 		{
 			in: testStructA{
-				testStructInner: testStructInner{
+				TestStructInner: TestStructInner{
 					Foo: 1,
 					bar: 2,
 					Baz: "3",
@@ -452,7 +453,7 @@ func TestAnyMarshal(t *T) {
 		},
 		{
 			in: testStructB{
-				testStructInner: &testStructInner{
+				TestStructInner: &TestStructInner{
 					Foo: 1,
 					bar: 2,
 					Baz: "3",
@@ -502,6 +503,7 @@ func TestAnyMarshal(t *T) {
 		})
 	}
 }
+*/
 
 type textCPUnmarshaler []byte
 
@@ -549,192 +551,562 @@ func (w *writer) Write(b []byte) (int, error) {
 }
 
 func TestAnyUnmarshal(t *T) {
+	type io [2]interface{}
+
 	type decodeTest struct {
-		in  string
-		out interface{}
+		descr string
+		ins   []string
 
-		// Instead of unmarshalling into a zero-value of out's type, unmarshal
-		// into a copy of this, then compare with out
-		preload interface{}
+		// all ins will be unmarshaled into a pointer to an empty interface, and
+		// that interface will be asserted to be equal to this value.
+		defaultOut interface{}
 
-		// like preload, but explicitly preload with a pointer to an empty
-		// interface
-		preloadEmpty bool
+		// for each in+io combination the in field will be unmarshaled into a
+		// pointer to the first element of the io, then the first and second
+		// elements of the io will be asserted to be equal.
+		mkIO func() []io
 
-		// instead of testing out, test that unmarshal returns an error
-		shouldErr string
+		// instead of testing ios and defaultOut, assert that unmarshal returns
+		// this specific error.
+		shouldErr error
+	}
+
+	strPtr := func(s string) *string { return &s }
+	bytPtr := func(b []byte) *[]byte { return &b }
+	intPtr := func(i int64) *int64 { return &i }
+	fltPtr := func(f float64) *float64 { return &f }
+
+	strIntoOuts := func(str string) []io {
+		return []io{
+			{"", str},
+			{"otherstring", str},
+			{(*string)(nil), strPtr(str)},
+			{strPtr(""), strPtr(str)},
+			{strPtr("otherstring"), strPtr(str)},
+			{[]byte{}, []byte(str)},
+			{[]byte(nil), []byte(str)},
+			{[]byte("f"), []byte(str)},
+			{[]byte("biglongstringblaaaaah"), []byte(str)},
+			{(*[]byte)(nil), bytPtr([]byte(str))},
+			{bytPtr(nil), bytPtr([]byte(str))},
+			{bytPtr([]byte("f")), bytPtr([]byte(str))},
+			{bytPtr([]byte("biglongstringblaaaaah")), bytPtr([]byte(str))},
+			{textCPUnmarshaler{}, textCPUnmarshaler(str)},
+			{binCPUnmarshaler{}, binCPUnmarshaler(str)},
+			{writer{}, writer(str)},
+		}
+	}
+
+	floatIntoOuts := func(f float64) []io {
+		return []io{
+			{float32(0), float32(f)},
+			{float32(1), float32(f)},
+			{float64(0), float64(f)},
+			{float64(1), float64(f)},
+			{(*float64)(nil), fltPtr(f)},
+			{fltPtr(0), fltPtr(f)},
+			{fltPtr(1), fltPtr(f)},
+			{new(big.Float), new(big.Float).SetFloat64(f)},
+			{false, f != 0},
+		}
+	}
+
+	intIntoOuts := func(i int64) []io {
+		ios := append(
+			floatIntoOuts(float64(i)),
+			io{int(0), int(i)},
+			io{int8(0), int8(i)},
+			io{int16(0), int16(i)},
+			io{int32(0), int32(i)},
+			io{int64(0), int64(i)},
+			io{int(1), int(i)},
+			io{int8(1), int8(i)},
+			io{int16(1), int16(i)},
+			io{int32(1), int32(i)},
+			io{int64(1), int64(i)},
+			io{(*int64)(nil), intPtr(i)},
+			io{intPtr(0), intPtr(i)},
+			io{intPtr(1), intPtr(i)},
+			io{new(big.Int), new(big.Int).SetInt64(i)},
+		)
+		if i >= 0 {
+			ios = append(ios,
+				io{uint(0), uint(i)},
+				io{uint8(0), uint8(i)},
+				io{uint16(0), uint16(i)},
+				io{uint32(0), uint32(i)},
+				io{uint64(0), uint64(i)},
+				io{uint(1), uint(i)},
+				io{uint8(1), uint8(i)},
+				io{uint16(1), uint16(i)},
+				io{uint32(1), uint32(i)},
+				io{uint64(1), uint64(i)},
+			)
+		}
+		return ios
+	}
+
+	nullIntoOuts := func() []io {
+		return []io{
+			{[]byte(nil), []byte(nil)},
+			{[]byte{}, []byte(nil)},
+			{[]byte{1}, []byte(nil)},
+			{[]string(nil), []string(nil)},
+			{[]string{}, []string(nil)},
+			{[]string{"ohey"}, []string(nil)},
+			{map[string]string(nil), map[string]string(nil)},
+			{map[string]string{}, map[string]string(nil)},
+			{map[string]string{"a": "b"}, map[string]string(nil)},
+			{(*int64)(nil), (*int64)(nil)},
+			{intPtr(0), (*int64)(nil)},
+			{intPtr(1), (*int64)(nil)},
+		}
 	}
 
 	decodeTests := []decodeTest{
-		// Bulk string
-		{in: "$-1\r\n", out: []byte(nil)},
-		{in: "$-1\r\n", preload: []byte{1}, out: []byte(nil)},
-		{in: "$-1\r\n", preloadEmpty: true, out: []byte(nil)},
-		{in: "$0\r\n\r\n", out: ""},
-		{in: "$0\r\n\r\n", out: []byte(nil)},
-		{in: "$4\r\nohey\r\n", out: "ohey"},
-		{in: "$4\r\nohey\r\n", out: []byte("ohey")},
-		{in: "$4\r\nohey\r\n", preload: []byte(nil), out: []byte("ohey")},
-		{in: "$4\r\nohey\r\n", preload: []byte(""), out: []byte("ohey")},
-		{in: "$4\r\nohey\r\n", preload: []byte("wut"), out: []byte("ohey")},
-		{in: "$4\r\nohey\r\n", preload: []byte("wutwut"), out: []byte("ohey")},
-		{in: "$4\r\nohey\r\n", out: textCPUnmarshaler("ohey")},
-		{in: "$4\r\nohey\r\n", out: binCPUnmarshaler("ohey")},
-		{in: "$4\r\nohey\r\n", out: writer("ohey")},
-		{in: "$2\r\n10\r\n", out: int(10)},
-		{in: "$2\r\n10\r\n", out: uint(10)},
-		{in: "$4\r\n10.5\r\n", out: float32(10.5)},
-		{in: "$4\r\n10.5\r\n", out: float64(10.5)},
-		{in: "$4\r\nohey\r\n", preloadEmpty: true, out: []byte("ohey")},
-		{in: "$4\r\nohey\r\n", out: nil},
-
-		// Simple string
-		{in: "+\r\n", out: ""},
-		{in: "+\r\n", out: []byte(nil)},
-		{in: "+ohey\r\n", out: "ohey"},
-		{in: "+ohey\r\n", out: []byte("ohey")},
-		{in: "+ohey\r\n", out: textCPUnmarshaler("ohey")},
-		{in: "+ohey\r\n", out: binCPUnmarshaler("ohey")},
-		{in: "+ohey\r\n", out: writer("ohey")},
-		{in: "+10\r\n", out: int(10)},
-		{in: "+10\r\n", out: uint(10)},
-		{in: "+10.5\r\n", out: float32(10.5)},
-		{in: "+10.5\r\n", out: float64(10.5)},
-		{in: "+ohey\r\n", preloadEmpty: true, out: "ohey"},
-		{in: "+ohey\r\n", out: nil},
-
-		// Err
-		{in: "-ohey\r\n", out: "", shouldErr: "ohey"},
-		{in: "-ohey\r\n", out: nil, shouldErr: "ohey"},
-
-		// Number
-		{in: ":1024\r\n", out: "1024"},
-		{in: ":1024\r\n", out: []byte("1024")},
-		{in: ":1024\r\n", out: textCPUnmarshaler("1024")},
-		{in: ":1024\r\n", out: binCPUnmarshaler("1024")},
-		{in: ":1024\r\n", out: writer("1024")},
-		{in: ":1024\r\n", out: int(1024)},
-		{in: ":1024\r\n", out: uint(1024)},
-		{in: ":1024\r\n", out: float32(1024)},
-		{in: ":1024\r\n", out: float64(1024)},
-		{in: ":1024\r\n", preloadEmpty: true, out: int64(1024)},
-		{in: ":1024\r\n", out: nil},
-
-		// Arrays
-		{in: "*-1\r\n", out: []interface{}(nil)},
-		{in: "*-1\r\n", out: []string(nil)},
-		{in: "*-1\r\n", out: map[string]string(nil)},
-		{in: "*-1\r\n", preloadEmpty: true, out: []interface{}(nil)},
-		{in: "*0\r\n", out: []interface{}{}},
-		{in: "*0\r\n", out: []string{}},
-		{in: "*0\r\n", preload: map[string]string(nil), out: map[string]string{}},
-		{in: "*2\r\n+foo\r\n+bar\r\n", out: []string{"foo", "bar"}},
-		{in: "*2\r\n+foo\r\n+bar\r\n", out: []interface{}{"foo", "bar"}},
-		{in: "*2\r\n+foo\r\n+bar\r\n", preloadEmpty: true, out: []interface{}{"foo", "bar"}},
-		{in: "*2\r\n+foo\r\n+5\r\n", preload: []interface{}{0, 1}, out: []interface{}{"foo", "5"}},
 		{
-			in: "*2\r\n*2\r\n+foo\r\n+bar\r\n*1\r\n+baz\r\n",
-			out: []interface{}{
-				[]interface{}{"foo", "bar"},
-				[]interface{}{"baz"},
+			descr:      "empty blob string",
+			ins:        []string{"$0\r\n\r\n"},
+			defaultOut: []byte{},
+			mkIO:       func() []io { return strIntoOuts("") },
+		},
+		{
+			descr:      "blob string",
+			ins:        []string{"$4\r\nohey\r\n"},
+			defaultOut: []byte("ohey"),
+			mkIO:       func() []io { return strIntoOuts("ohey") },
+		},
+		{
+			descr:      "integer blob string",
+			ins:        []string{"$2\r\n10\r\n"},
+			defaultOut: []byte("10"),
+			mkIO:       func() []io { return append(strIntoOuts("10"), intIntoOuts(10)...) },
+		},
+		{
+			descr:      "float blob string",
+			ins:        []string{"$4\r\n10.5\r\n"},
+			defaultOut: []byte("10.5"),
+			mkIO:       func() []io { return append(strIntoOuts("10.5"), floatIntoOuts(10.5)...) },
+		},
+		{
+			descr:      "null blob string", // only for backwards compatibility
+			ins:        []string{"$-1\r\n"},
+			defaultOut: []byte(nil),
+			mkIO:       func() []io { return nullIntoOuts() },
+		},
+		{
+			descr:      "blob string with delim",
+			ins:        []string{"$6\r\nab\r\ncd\r\n"},
+			defaultOut: []byte("ab\r\ncd"),
+			mkIO:       func() []io { return strIntoOuts("ab\r\ncd") },
+		},
+		{
+			descr:      "empty simple string",
+			ins:        []string{"+\r\n"},
+			defaultOut: "",
+			mkIO:       func() []io { return strIntoOuts("") },
+		},
+		{
+			descr:      "simple string",
+			ins:        []string{"+ohey\r\n"},
+			defaultOut: "ohey",
+			mkIO:       func() []io { return strIntoOuts("ohey") },
+		},
+		{
+			descr:      "integer simple string",
+			ins:        []string{"+10\r\n"},
+			defaultOut: "10",
+			mkIO:       func() []io { return append(strIntoOuts("10"), intIntoOuts(10)...) },
+		},
+		{
+			descr:      "float simple string",
+			ins:        []string{"+10.5\r\n"},
+			defaultOut: "10.5",
+			mkIO:       func() []io { return append(strIntoOuts("10.5"), floatIntoOuts(10.5)...) },
+		},
+		{
+			descr:     "empty simple error",
+			ins:       []string{"-\r\n"},
+			shouldErr: resp.ErrConnUsable{Err: SimpleError{S: ""}},
+		},
+		{
+			descr:     "simple error",
+			ins:       []string{"-ohey\r\n"},
+			shouldErr: resp.ErrConnUsable{Err: SimpleError{S: "ohey"}},
+		},
+		{
+			descr:      "zero number",
+			ins:        []string{":0\r\n"},
+			defaultOut: int64(0),
+			mkIO:       func() []io { return append(strIntoOuts("0"), intIntoOuts(0)...) },
+		},
+		{
+			descr:      "positive number",
+			ins:        []string{":10\r\n"},
+			defaultOut: int64(10),
+			mkIO:       func() []io { return append(strIntoOuts("10"), intIntoOuts(10)...) },
+		},
+		{
+			descr:      "negative number",
+			ins:        []string{":-10\r\n"},
+			defaultOut: int64(-10),
+			mkIO:       func() []io { return append(strIntoOuts("-10"), intIntoOuts(-10)...) },
+		},
+		{
+			descr:      "null",
+			ins:        []string{"_\r\n"},
+			defaultOut: nil,
+			mkIO:       func() []io { return nullIntoOuts() },
+		},
+		{
+			descr:      "zero double",
+			ins:        []string{",0\r\n"},
+			defaultOut: float64(0),
+			mkIO:       func() []io { return append(strIntoOuts("0"), floatIntoOuts(0)...) },
+		},
+		{
+			descr:      "positive double",
+			ins:        []string{",10.5\r\n"},
+			defaultOut: float64(10),
+			mkIO:       func() []io { return append(strIntoOuts("10.5"), floatIntoOuts(10.5)...) },
+		},
+		{
+			descr:      "positive double infinity",
+			ins:        []string{",inf\r\n"},
+			defaultOut: math.Inf(1),
+			mkIO:       func() []io { return append(strIntoOuts("inf"), floatIntoOuts(math.Inf(1))...) },
+		},
+		{
+			descr:      "negative double",
+			ins:        []string{",-10.5\r\n"},
+			defaultOut: float64(-10),
+			mkIO:       func() []io { return append(strIntoOuts("-10.5"), floatIntoOuts(-10.5)...) },
+		},
+		{
+			descr:      "negative double infinity",
+			ins:        []string{",-inf\r\n"},
+			defaultOut: math.Inf(-1),
+			mkIO:       func() []io { return append(strIntoOuts("-inf"), floatIntoOuts(math.Inf(-1))...) },
+		},
+		{
+			descr:      "true",
+			ins:        []string{"#t\r\n"},
+			defaultOut: true,
+			// intIntoOuts will include actually unmarshaling into a bool
+			mkIO: func() []io { return append(strIntoOuts("1"), intIntoOuts(1)...) },
+		},
+		{
+			descr:      "false",
+			ins:        []string{"#f\r\n"},
+			defaultOut: false,
+			// intIntoOuts will include actually unmarshaling into a bool
+			mkIO: func() []io { return append(strIntoOuts("0"), intIntoOuts(0)...) },
+		},
+		{
+			descr:     "empty blob error",
+			ins:       []string{"!0\r\n\r\n"},
+			shouldErr: resp.ErrConnUsable{Err: BlobError{B: []byte{}}},
+		},
+		{
+			descr:     "blob error",
+			ins:       []string{"!4\r\nohey\r\n"},
+			shouldErr: resp.ErrConnUsable{Err: BlobError{B: []byte("ohey")}},
+		},
+		{
+			descr:     "blob error with delim",
+			ins:       []string{"!6\r\noh\r\ney\r\n"},
+			shouldErr: resp.ErrConnUsable{Err: BlobError{B: []byte("oh\r\ney")}},
+		},
+		{
+			descr:      "empty verbatim string",
+			ins:        []string{"=4\r\ntxt:\r\n"},
+			defaultOut: "",
+			mkIO:       func() []io { return strIntoOuts("") },
+		},
+		{
+			descr:      "verbatim string",
+			ins:        []string{"=8\r\ntxt:ohey\r\n"},
+			defaultOut: "",
+			mkIO:       func() []io { return strIntoOuts("ohey") },
+		},
+		{
+			descr:      "verbatim string with delim",
+			ins:        []string{"=10\r\ntxt:oh\r\ney\r\n"},
+			defaultOut: "",
+			mkIO:       func() []io { return strIntoOuts("oh\r\ney") },
+		},
+		{
+			descr:      "zero big number",
+			ins:        []string{"(0\r\n"},
+			defaultOut: new(big.Int),
+			mkIO:       func() []io { return append(strIntoOuts("0"), intIntoOuts(0)...) },
+		},
+		{
+			descr:      "positive big number",
+			ins:        []string{"(1000\r\n"},
+			defaultOut: new(big.Int).SetInt64(1000),
+			mkIO:       func() []io { return append(strIntoOuts("1000"), intIntoOuts(1000)...) },
+		},
+		{
+			descr:      "negative big number",
+			ins:        []string{"(-1000\r\n"},
+			defaultOut: new(big.Int).SetInt64(-1000),
+			mkIO:       func() []io { return append(strIntoOuts("-1000"), intIntoOuts(-1000)...) },
+		},
+		{
+			descr:      "null array", // only for backwards compatibility
+			ins:        []string{"*-1\r\n"},
+			defaultOut: []interface{}(nil),
+			mkIO:       func() []io { return nullIntoOuts() },
+		},
+		{
+			descr: "empty agg",
+			ins: []string{
+				"*0\r\n",
+				"%0\r\n",
+				"~0\r\n",
+				// push cannot be empty, don't test it here
+
+				// equivalent streamed aggs
+				"*?\r\n.\r\n",
+				"%?\r\n.\r\n",
+				"~?\r\n.\r\n",
+			},
+			defaultOut: []interface{}{},
+			mkIO: func() []io {
+				return []io{
+					{[][]byte(nil), [][]byte{}},
+					{[][]byte{}, [][]byte{}},
+					{[][]byte{[]byte("a")}, [][]byte{}},
+					{[]string(nil), []string{}},
+					{[]string{}, []string{}},
+					{[]string{"a"}, []string{}},
+					{[]int(nil), []int{}},
+					{[]int{}, []int{}},
+					{[]int{5}, []int{}},
+					{map[string][]byte(nil), map[string][]byte{}},
+					{map[string][]byte{}, map[string][]byte{}},
+					{map[string][]byte{"a": []byte("b")}, map[string][]byte{}},
+					{map[string]string(nil), map[string]string{}},
+					{map[string]string{}, map[string]string{}},
+					{map[string]string{"a": "b"}, map[string]string{}},
+					{map[int]int(nil), map[int]int{}},
+					{map[int]int{}, map[int]int{}},
+					{map[int]int{5: 5}, map[int]int{}},
+				}
 			},
 		},
 		{
-			in:  "*2\r\n*2\r\n+foo\r\n+bar\r\n*1\r\n+baz\r\n",
-			out: [][]string{{"foo", "bar"}, {"baz"}},
-		},
-		{
-			in:  "*2\r\n*2\r\n+foo\r\n+bar\r\n+baz\r\n",
-			out: []interface{}{[]interface{}{"foo", "bar"}, "baz"},
-		},
-		{in: "*2\r\n:1\r\n:2\r\n", out: map[string]string{"1": "2"}},
-		{in: "*2\r\n*2\r\n+foo\r\n+bar\r\n*1\r\n+baz\r\n", out: nil},
-		{
-			in: "*6\r\n" +
-				"$3\r\none\r\n" + "*2\r\n$1\r\n!\r\n$1\r\n1\r\n" +
-				"$3\r\ntwo\r\n" + "*2\r\n$2\r\n!!\r\n$1\r\n2\r\n" +
-				"$5\r\nthree\r\n" + "*2\r\n$3\r\n!!!\r\n$1\r\n3\r\n",
-			out: map[string]map[string]int{
-				"one":   {"!": 1},
-				"two":   {"!!": 2},
-				"three": {"!!!": 3},
-			},
-		},
-		{
-			in: "*4\r\n" +
-				"$5\r\nhElLo\r\n" + "$5\r\nWoRlD\r\n" +
-				"$3\r\nFoO\r\n" + "$3\r\nbAr\r\n",
-			out: map[upperCaseUnmarshaler]lowerCaseUnmarshaler{
-				"HELLO": "world",
-				"FOO":   "bar",
-			},
-		},
+			descr: "two element agg",
+			ins: []string{
+				"*2\r\n+666\r\n:1\r\n",
+				"%1\r\n+666\r\n:1\r\n",
+				"~2\r\n+666\r\n:1\r\n",
+				">2\r\n+666\r\n:1\r\n",
 
-		// Arrays (structs)
-		{
-			in: "*10\r\n" +
-				"$3\r\nBAZ\r\n" + "$1\r\n3\r\n" +
-				"$3\r\nFoo\r\n" + ":1\r\n" +
-				"$3\r\nBoz\r\n" + ":100\r\n" +
-				"$3\r\nDNE\r\n" + ":1000\r\n" +
-				"$3\r\nBiz\r\n" + "$1\r\n5\r\n",
-			out: testStructA{
-				testStructInner: testStructInner{
-					Foo: 1,
-					Baz: "3",
-					Boz: intPtr(100),
-				},
-				Biz: []byte("5"),
+				// equivalent streamed aggs
+				"*?\r\n+666\r\n:1\r\n.\r\n",
+				"%?\r\n+666\r\n:1\r\n.\r\n",
+				"~?\r\n+666\r\n:1\r\n.\r\n",
+			},
+			defaultOut: []interface{}{"666", 1},
+			mkIO: func() []io {
+				return []io{
+					{[][]byte(nil), [][]byte{[]byte("666"), []byte("1")}},
+					{[][]byte{}, [][]byte{[]byte("666"), []byte("1")}},
+					{[][]byte{[]byte("a")}, [][]byte{[]byte("666"), []byte("1")}},
+					{[]string(nil), []string{"666", "1"}},
+					{[]string{}, []string{"666", "1"}},
+					{[]string{"a"}, []string{"666", "1"}},
+					{[]int(nil), []int{666, 1}},
+					{[]int{}, []int{666, 1}},
+					{[]int{5}, []int{666, 1}},
+					{map[string][]byte(nil), map[string][]byte{"666": []byte("1")}},
+					{map[string][]byte{}, map[string][]byte{"666": []byte("1")}},
+					{map[string][]byte{"a": []byte("b")}, map[string][]byte{"666": []byte("1")}},
+					{map[string]string(nil), map[string]string{"666": "1"}},
+					{map[string]string{}, map[string]string{"666": "1"}},
+					{map[string]string{"a": "b"}, map[string]string{"666": "1"}},
+					{map[int]int(nil), map[int]int{666: 1}},
+					{map[int]int{}, map[int]int{666: 1}},
+					{map[int]int{5: 5}, map[int]int{666: 1}},
+				}
 			},
 		},
 		{
-			in: "*10\r\n" +
-				"$3\r\nBAZ\r\n" + "$1\r\n3\r\n" +
-				"$3\r\nBiz\r\n" + "$1\r\n5\r\n" +
-				"$3\r\nBoz\r\n" + ":100\r\n" +
-				"$3\r\nDNE\r\n" + ":1000\r\n" +
-				"$3\r\nFoo\r\n" + ":1\r\n",
-			preload: testStructB{testStructInner: new(testStructInner)},
-			out: testStructB{
-				testStructInner: &testStructInner{
-					Foo: 1,
-					Baz: "3",
-					Boz: intPtr(100),
-				},
-				Biz: []byte("5"),
+			descr: "nested two element agg",
+			ins: []string{
+				"*1\r\n*2\r\n+666\r\n:1\r\n",
+				"*1\r\n%1\r\n+666\r\n:1\r\n",
+				"~1\r\n~2\r\n+666\r\n:1\r\n",
+				"*1\r\n>2\r\n+666\r\n:1\r\n", // this is not possible but w/e
+
+				// equivalent streamed aggs
+				"*?\r\n*2\r\n+666\r\n:1\r\n.\r\n",
+				"*?\r\n%1\r\n+666\r\n:1\r\n.\r\n",
+				"~?\r\n~2\r\n+666\r\n:1\r\n.\r\n",
 			},
+			defaultOut: []interface{}{[]interface{}{"666", 1}},
+			mkIO: func() []io {
+				return []io{
+					{[][][]byte(nil), [][][]byte{{[]byte("666"), []byte("1")}}},
+					{[][][]byte{}, [][][]byte{{[]byte("666"), []byte("1")}}},
+					{[][][]byte{{}, {[]byte("a")}}, [][][]byte{{[]byte("666"), []byte("1")}}},
+					{[][]string(nil), [][]string{{"666", "1"}}},
+					{[][]string{}, [][]string{{"666", "1"}}},
+					{[][]string{{}, {"a"}}, [][]string{{"666", "1"}}},
+					{[][]int(nil), [][]int{{666, 1}}},
+					{[][]int{}, [][]int{{666, 1}}},
+					{[][]int{{7}, {5}}, [][]int{{666, 1}}},
+					{[]map[string][]byte(nil), []map[string][]byte{{"666": []byte("1")}}},
+					{[]map[string][]byte{}, []map[string][]byte{{"666": []byte("1")}}},
+					{[]map[string][]byte{{}, {"a": []byte("b")}}, []map[string][]byte{{"666": []byte("1")}}},
+					{[]map[string]string(nil), []map[string]string{{"666": "1"}}},
+					{[]map[string]string{}, []map[string]string{{"666": "1"}}},
+					{[]map[string]string{{}, {"a": "b"}}, []map[string]string{{"666": "1"}}},
+					{[]map[int]int(nil), []map[int]int{{666: 1}}},
+					{[]map[int]int{}, []map[int]int{{666: 1}}},
+					{[]map[int]int{{4: 2}, {7: 5}}, []map[int]int{{666: 1}}},
+				}
+			},
+		},
+		{
+			descr: "keyed nested two element agg",
+			ins: []string{
+				"*2\r\n$2\r\n10\r\n*2\r\n+666\r\n:1\r\n",
+				"%1\r\n$2\r\n10\r\n%1\r\n+666\r\n:1\r\n",
+				"~2\r\n$2\r\n10\r\n~2\r\n+666\r\n:1\r\n",
+				">2\r\n$2\r\n10\r\n>2\r\n+666\r\n:1\r\n",
+
+				// equivalent streamed aggs
+				"*?\r\n$2\r\n10\r\n*2\r\n+666\r\n:1\r\n.\r\n",
+				"%?\r\n$2\r\n10\r\n%1\r\n+666\r\n:1\r\n.\r\n",
+				"~?\r\n$2\r\n10\r\n~2\r\n+666\r\n:1\r\n.\r\n",
+				">?\r\n$2\r\n10\r\n>2\r\n+666\r\n:1\r\n.\r\n",
+			},
+			defaultOut: []interface{}{[]byte("10"), []interface{}{"666", 1}},
+			mkIO: func() []io {
+				return []io{
+					{map[string]map[string][]byte(nil), map[string]map[string][]byte{"10": {"666": []byte("1")}}},
+					{map[string]map[string][]byte{}, map[string]map[string][]byte{"10": {"666": []byte("1")}}},
+					{map[string]map[string][]byte{"foo": {"a": []byte("b")}}, map[string]map[string][]byte{"10": {"666": []byte("1")}}},
+					{map[string]map[string]string(nil), map[string]map[string]string{"10": {"666": "1"}}},
+					{map[string]map[string]string{}, map[string]map[string]string{"10": {"666": "1"}}},
+					{map[string]map[string]string{"foo": {"a": "b"}}, map[string]map[string]string{"10": {"666": "1"}}},
+					{map[string]map[int]int(nil), map[string]map[int]int{"10": {666: 1}}},
+					{map[string]map[int]int{}, map[string]map[int]int{"10": {666: 1}}},
+					{map[string]map[int]int{"foo": {4: 2}}, map[string]map[int]int{"10": {666: 1}}},
+					{map[int]map[int]int(nil), map[int]map[int]int{10: {666: 1}}},
+					{map[int]map[int]int{}, map[int]map[int]int{10: {666: 1}}},
+					{map[int]map[int]int{5: {4: 2}}, map[int]map[int]int{10: {666: 1}}},
+				}
+			},
+		},
+		{
+			descr: "agg into structs",
+			ins: []string{
+				"*10\r\n+Foo\r\n:1\r\n+BAZ\r\n:2\r\n+Boz\r\n:3\r\n+Biz\r\n:4\r\n+Other\r\n:5\r\n",
+				"%5\r\n+Foo\r\n:1\r\n+BAZ\r\n:2\r\n+Boz\r\n:3\r\n+Biz\r\n:4\r\n+Other\r\n:5\r\n",
+				"~10\r\n+Foo\r\n:1\r\n+BAZ\r\n:2\r\n+Boz\r\n:3\r\n+Biz\r\n:4\r\n+Other\r\n:5\r\n",
+
+				// equivalent streamed aggs
+				"*?\r\n+Foo\r\n:1\r\n+BAZ\r\n:2\r\n+Boz\r\n:3\r\n+Biz\r\n:4\r\n+Other\r\n:5\r\n.\r\n",
+				"%?\r\n+Foo\r\n:1\r\n+BAZ\r\n:2\r\n+Boz\r\n:3\r\n+Biz\r\n:4\r\n+Other\r\n:5\r\n.\r\n",
+				"~?\r\n+Foo\r\n:1\r\n+BAZ\r\n:2\r\n+Boz\r\n:3\r\n+Biz\r\n:4\r\n+Other\r\n:5\r\n.\r\n",
+			},
+			defaultOut: []interface{}{"Foo", 1, "BAZ", 2, "Boz", 3, "Biz", 4},
+			mkIO: func() []io {
+				return []io{
+					{testStructA{}, testStructA{TestStructInner{Foo: 1, Baz: "2", Boz: intPtr(3)}, []byte("4")}},
+					{&testStructA{}, &testStructA{TestStructInner{Foo: 1, Baz: "2", Boz: intPtr(3)}, []byte("4")}},
+					{testStructA{TestStructInner{bar: 6}, []byte("foo")}, testStructA{TestStructInner{Foo: 1, bar: 6, Baz: "2", Boz: intPtr(3)}, []byte("4")}},
+					{&testStructA{TestStructInner{bar: 6}, []byte("foo")}, &testStructA{TestStructInner{Foo: 1, bar: 6, Baz: "2", Boz: intPtr(3)}, []byte("4")}},
+					{testStructB{}, testStructB{&TestStructInner{Foo: 1, Baz: "2", Boz: intPtr(3)}, []byte("4")}},
+					{&testStructB{}, &testStructB{&TestStructInner{Foo: 1, Baz: "2", Boz: intPtr(3)}, []byte("4")}},
+					{testStructB{&TestStructInner{bar: 6}, []byte("foo")}, testStructB{&TestStructInner{Foo: 1, bar: 6, Baz: "2", Boz: intPtr(3)}, []byte("4")}},
+					{&testStructB{&TestStructInner{bar: 6}, []byte("foo")}, &testStructB{&TestStructInner{Foo: 1, bar: 6, Baz: "2", Boz: intPtr(3)}, []byte("4")}},
+				}
+			},
+		},
+		{
+			descr:      "empty streamed string",
+			ins:        []string{"$?\r\n;0\r\n"},
+			defaultOut: writer{},
+			mkIO:       func() []io { return strIntoOuts("") },
+		},
+		{
+			descr: "streamed string",
+			ins: []string{
+				"$?\r\n;4\r\nohey\r\n;0\r\n",
+				"$?\r\n;2\r\noh\r\n;2\r\ney\r\n;0\r\n",
+				"$?\r\n;1\r\no\r\n;1\r\nh\r\n;2\r\ney\r\n;0\r\n",
+			},
+			defaultOut: writer("ohey"),
+			mkIO:       func() []io { return strIntoOuts("ohey") },
 		},
 	}
 
-	for i, dt := range decodeTests {
-		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
-			br := bufio.NewReader(bytes.NewBufferString(dt.in))
+	for _, dt := range decodeTests {
+		t.Run(dt.descr, func(t *testing.T) {
+			for i, in := range dt.ins {
+				if dt.shouldErr != nil {
+					buf := bytes.NewBufferString(in)
+					err := Any{}.UnmarshalRESP(bufio.NewReader(buf))
+					assert.Equal(t, dt.shouldErr, err)
+					assert.Empty(t, buf.Bytes())
+					continue
+				}
 
-			var into interface{}
-			if dt.preloadEmpty {
-				emptyInterfaceT := reflect.TypeOf([]interface{}(nil)).Elem()
-				into = reflect.New(emptyInterfaceT).Interface()
-			} else if dt.preload != nil {
-				intov := reflect.New(reflect.TypeOf(dt.preload))
-				intov.Elem().Set(reflect.ValueOf(dt.preload))
-				into = intov.Interface()
-			} else if dt.out != nil {
-				into = reflect.New(reflect.TypeOf(dt.out)).Interface()
-			}
+				t.Run("discard", func(t *testing.T) {
+					buf := bytes.NewBufferString(in)
+					br := bufio.NewReader(buf)
+					err := Any{}.UnmarshalRESP(br)
+					assert.NoError(t, err)
+					assert.Empty(t, buf.Bytes())
+				})
 
-			err := Any{I: into}.UnmarshalRESP(br)
-			if dt.shouldErr != "" {
-				require.NotNil(t, err)
-				assert.Equal(t, dt.shouldErr, err.Error())
-				return
-			}
+				t.Run(fmt.Sprintf("in%d", i), func(t *testing.T) {
+					run := func(withAttr bool) func(t *testing.T) {
+						return func(t *testing.T) {
+							for j, io := range dt.mkIO() {
+								t.Run(fmt.Sprintf("io%d", j), func(t *testing.T) {
+									t.Logf("%q -> %#v", in, io[0])
+									buf := bytes.NewBufferString(in)
+									br := bufio.NewReader(buf)
 
-			require.Nil(t, err)
-			if dt.out != nil {
-				aI := reflect.ValueOf(into).Elem().Interface()
-				assert.Equal(t, dt.out, aI)
-			} else {
-				assert.Nil(t, into)
+									if withAttr {
+										AttributeHeader{NumPairs: 2}.MarshalRESP(buf)
+										SimpleString{S: "foo"}.MarshalRESP(buf)
+										SimpleString{S: "1"}.MarshalRESP(buf)
+										SimpleString{S: "bar"}.MarshalRESP(buf)
+										SimpleString{S: "2"}.MarshalRESP(buf)
+									}
+
+									io0Val := reflect.ValueOf(io[0])
+									into := reflect.New(io0Val.Type())
+									into.Elem().Set(io0Val)
+
+									err := Any{I: into.Interface()}.UnmarshalRESP(br)
+									assert.NoError(t, err)
+
+									io0 := into.Elem().Interface()
+									switch io1 := io[1].(type) {
+									case *big.Int:
+										assert.Zero(t, io1.Cmp(io0.(*big.Int)))
+									case *big.Float:
+										assert.Zero(t, io1.Cmp(io0.(*big.Float)))
+									default:
+										assert.Equal(t, io[1], into.Elem().Interface())
+									}
+									assert.Empty(t, buf.Bytes())
+								})
+							}
+						}
+					}
+
+					t.Run("with attr", run(true))
+					t.Run("without attr", run(false))
+				})
 			}
 		})
 	}
